@@ -1,6 +1,6 @@
 [project]
 name = "xbalance"
-version = "0.1.0"
+version = "0.1.1-alpha"
 description = "Multi-socket SOCKS5 load balancer for V2Ray/Xray configs"
 readme = "README.md"
 requires-python = ">=3.10"

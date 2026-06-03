@@ -1,6 +1,6 @@
 import asyncio
-import atexit
 import base64
+import logging
 import os
 import sys
 import urllib.request
@@ -11,21 +11,50 @@ from colorama import init as colorama_init
 
 from utils.balancer import AsyncSOCKS5Balancer
 from utils.parser import parse_uri_to_outbound
-from utils.xray import XrayWorkerManager, cleanup_stale_configs, ensure_xray_binary
+from utils.xray import (
+    XrayWorkerManager,
+    cleanup_stale_configs,
+    ensure_xray_binary,
+    kill_stale_xray,
+)
 
-BALANCER_HOST = "127.0.0.1"
+BALANCER_HOST = "0.0.0.0"
 BALANCER_PORT = 7070
 CONFIGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs.txt")
+LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "xbalance.log")
 
 BANNER = f"""
 {Fore.CYAN}================================ XBalance ================================
-{Fore.CYAN}  Multi-Socket SOCKS5 Load Balancer  |  v0.1.0{Fore.RESET}
+{Fore.CYAN}  Multi-Socket SOCKS5 Load Balancer  |  v0.1.1-alpha{Fore.RESET}
 {Fore.CYAN}========================================================================={Fore.RESET}
 """
 
 
+def setup_logging():
+    """Configure logging to both file and console."""
+    logger = logging.getLogger("xbalance")
+    logger.setLevel(logging.DEBUG)
+
+    file_handler = logging.FileHandler(LOG_FILE, mode="w", encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(
+        logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    )
+
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.WARNING)
+    console_handler.setFormatter(logging.Formatter("%(message)s"))
+
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+
+    return logging.getLogger("xbalance.main")
+
+
 def load_raw_configs() -> List[str]:
     """Reads configs from configs.txt. Fetches subscriptions if URLs are found."""
+    log = logging.getLogger("xbalance.main")
+
     if not os.path.exists(CONFIGS_FILE):
         with open(CONFIGS_FILE, "w", encoding="utf-8") as f:
             f.write(
@@ -42,6 +71,7 @@ def load_raw_configs() -> List[str]:
 
             if line.startswith("http://") or line.startswith("https://"):
                 print(f"{Fore.YELLOW}[*] Fetching subscription: {line}{Fore.RESET}")
+                log.info("Fetching subscription: %s", line)
                 try:
                     headers = {
                         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/110.0.0.0"
@@ -67,6 +97,7 @@ def load_raw_configs() -> List[str]:
                         print(
                             f"{Fore.GREEN}[+] Fetched {count} configs from subscription!{Fore.RESET}"
                         )
+                        log.info("Fetched %d configs from subscription", count)
                         for sub_link in sub_links:
                             sub_link = sub_link.strip()
                             if sub_link and not sub_link.startswith("#"):
@@ -75,6 +106,7 @@ def load_raw_configs() -> List[str]:
                     print(
                         f"{Fore.RED}[-] Failed to fetch subscription: {e}{Fore.RESET}"
                     )
+                    log.error("Failed to fetch subscription %s: %s", line, e)
             else:
                 configs.append(line)
 
@@ -86,7 +118,7 @@ async def stats_printer_loop(balancer: AsyncSOCKS5Balancer):
     try:
         while True:
             await asyncio.sleep(2)
-            os.system("cls" if os.name == "nt" else "clear")
+            print("\033c", end="")
             print(BANNER)
             print(
                 f"  {Fore.CYAN}Proxy Address :{Fore.RESET}  socks://Og@{balancer.host}:{balancer.port}#XBalance"
@@ -115,8 +147,13 @@ async def stats_printer_loop(balancer: AsyncSOCKS5Balancer):
 
 async def main():
     """Main entrypoint: parse configs, start xray workers, run balancer."""
+    log = setup_logging()
     colorama_init()
     print(BANNER)
+    log.info("XBalance starting up")
+
+    # 0. Kill any orphan xray processes from previous runs
+    kill_stale_xray()
 
     # 1. Ensure xray binary
     xray_bin = ensure_xray_binary()
@@ -144,12 +181,12 @@ async def main():
         return
 
     print(f"{Fore.GREEN}[+] Parsed {len(outbounds)} configs successfully.{Fore.RESET}")
+    log.info("Parsed %d outbound configs", len(outbounds))
 
     # 4. Start Xray workers
     manager = XrayWorkerManager(xray_bin)
-    atexit.register(manager.stop_all)
     print(f"{Fore.YELLOW}[*] Starting {len(outbounds)} local workers...{Fore.RESET}")
-    worker_ports = manager.start_workers(outbounds)
+    worker_ports = await manager.start_workers(outbounds)
 
     if not worker_ports:
         print(
@@ -158,6 +195,7 @@ async def main():
         return
 
     print(f"{Fore.GREEN}[+] {len(worker_ports)} workers running!{Fore.RESET}")
+    log.info("%d workers running on ports %s", len(worker_ports), worker_ports)
 
     # 5. Start the SOCKS5 balancer
     balancer = AsyncSOCKS5Balancer(BALANCER_HOST, BALANCER_PORT, worker_ports)
@@ -171,6 +209,7 @@ async def main():
     finally:
         stats_task.cancel()
         manager.stop_all()
+        log.info("XBalance shutdown complete")
 
 
 def main_cli():
