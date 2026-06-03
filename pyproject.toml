@@ -1,11 +1,7 @@
 [project]
 name = "xbalance"
 version = "0.1.0"
-<<<<<<< HEAD
 description = "Multi-socket SOCKS5/HTTP load balancer for V2Ray/Xray configs with parallel downloads"
-=======
-description = "Multi-socket SOCKS5 load balancer for V2Ray/Xray configs"
->>>>>>> 7661e8809e2bb8bba38b6f7566e52ed02d8470fd
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
