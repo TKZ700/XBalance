@@ -85,7 +85,7 @@ cd XBalance
 ### 2. Install dependencies
 
 ```bash
-pip install colorama
+pip install colorama rich
 ```
 
 Or if using `uv`:
