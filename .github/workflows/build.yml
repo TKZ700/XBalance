@@ -1,0 +1,44 @@
+name: Build Windows CLI
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: |
+          # Install PyInstaller and your project dependencies
+          uv pip install pyinstaller
+          if (Test-Path "pyproject.toml") {
+            uv sync
+          } elseif (Test-Path "requirements.txt") {
+            uv pip install -r requirements.txt
+          }
+
+      - name: Build with PyInstaller
+        # REMOVED --noconsole so the terminal window opens
+        # ADDED --name to give it a clean exe name
+        run: |
+          uv run pyinstaller --onefile --console main.py
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-cli-tool
+          path: dist/main.exe

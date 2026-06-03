@@ -7,6 +7,9 @@ from typing import List
 
 from colorama import Fore
 
+from utils.peekable import PeekableStreamReader
+from utils.worker_selector import WorkerSelector
+
 log = logging.getLogger("xbalance.balancer")
 
 PIPE_BUFFER_SIZE = 1048576  # 1MB read buffer for streaming throughput
@@ -16,33 +19,46 @@ def _tune_socket(sock: socket.socket):
     """Apply high-throughput socket options."""
     try:
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 262144)  # 256KB send
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)  # 256KB recv
-        # TCP keepalive: detect dead connections after 60s idle
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 262144)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
         if sys.platform == "win32":
             sock.ioctl(
                 socket.SIO_KEEPALIVE_VALS,
-                (1, 60000, 30000),  # enable, idle=60s, interval=30s
+                (1, 60000, 30000),
             )
     except Exception:
         pass
 
 
 class AsyncSOCKS5Balancer:
-    """
-    An asynchronous SOCKS5 proxy server that listens on a local port
-    and routes every incoming request to a pool of local SOCKS5 workers
-    sequentially (Round-Robin).
-    """
+    """Async SOCKS5 proxy with smart worker selection and optional HTTP peek."""
 
-    def __init__(self, host: str, port: int, worker_ports: List[int]):
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        selector: WorkerSelector,
+        peek_http: bool = False,
+    ):
         self.host = host
         self.port = port
-        self.worker_ports = worker_ports
-        self.rr_index = 0
+        self.selector = selector
+        self.peek_http = peek_http
         self.active_connections = 0
-        self.connection_stats = dict.fromkeys(worker_ports, 0)
+        self.rr_index = 0  # kept for backward compat with stats display
+
+    @property
+    def worker_ports(self):
+        return self.selector.worker_ports
+
+    @property
+    def connection_stats(self):
+        return self.selector.stats.active_conns
+
+    @property
+    def rr_index_display(self):
+        return sum(self.selector.stats.total_requests.values())
 
     async def start(self):
         if not self.worker_ports:
@@ -59,12 +75,6 @@ class AsyncSOCKS5Balancer:
 
         async with server:
             await server.serve_forever()
-
-    def get_next_worker_port(self) -> int:
-        port = self.worker_ports[self.rr_index % len(self.worker_ports)]
-        self.connection_stats[port] += 1
-        self.rr_index += 1
-        return port
 
     async def handle_client(
         self, client_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter
@@ -120,8 +130,8 @@ class AsyncSOCKS5Balancer:
                 await client_writer.drain()
                 return
 
-            # === Step 3: Pick a worker via Round-Robin ===
-            worker_port = self.get_next_worker_port()
+            # === Step 3: Pick a worker via smart selector ===
+            worker_port = self.selector.next_worker()
 
             # === Step 4: Connect to the local Xray SOCKS5 worker ===
             try:
@@ -135,6 +145,7 @@ class AsyncSOCKS5Balancer:
                 client_writer.write(struct.pack("!BBBBIH", 5, 0x04, 0, 1, 0, 0))
                 await client_writer.drain()
                 log.error("Failed to connect to worker port %d: %s", worker_port, e)
+                self.selector.on_failure(worker_port)
                 return
 
             # SOCKS5 handshake with worker (coalesced into single write)
@@ -146,6 +157,7 @@ class AsyncSOCKS5Balancer:
                 client_writer.write(struct.pack("!BBBBIH", 5, 0x01, 0, 1, 0, 0))
                 await client_writer.drain()
                 log.warning("Worker port %d auth failed", worker_port)
+                self.selector.on_failure(worker_port)
                 return
 
             # Forward the exact CONNECT request to the worker
@@ -173,45 +185,30 @@ class AsyncSOCKS5Balancer:
 
             if rep != 0:
                 log.warning("Worker port %d CONNECT rejected (rep=%d)", worker_port, rep)
+                self.selector.on_failure(worker_port)
                 return
 
             log.info("Relay established: %s -> port %d", client_addr, worker_port)
+            self.selector.on_connection_open(worker_port)
 
-            # === Step 5: Bidirectional relay (cancel-safe) ===
-            # Get raw transports for zero-copy relay
-            client_transport = client_writer.transport
-            worker_transport = worker_writer.transport
+            # === Step 5: Peek for HTTP traffic (optional) ===
+            if self.peek_http:
+                peekable = PeekableStreamReader(client_reader)
+                try:
+                    peek_data = await peekable.peek(7, timeout=2.0)
+                    if peek_data.startswith((b"GET ", b"POST ", b"HEAD ", b"PUT ")):
+                        log.info("HTTP detected in SOCKS5 tunnel from %s", client_addr)
+                    # Whether HTTP or not, proceed with relay using the peekable reader
+                    await self._relay_with_peekable(peekable, worker_reader, client_writer, worker_writer)
+                    return
+                except asyncio.TimeoutError:
+                    # Not HTTP or no data yet — fall through to normal relay
+                    pass
+                except Exception:
+                    pass
 
-            pipe_c2w = asyncio.create_task(
-                self._relay(client_reader, worker_transport, "c2w")
-            )
-            pipe_w2c = asyncio.create_task(
-                self._relay(worker_reader, client_transport, "w2c")
-            )
-
-            # When either direction finishes, cancel the other immediately
-            done, pending = await asyncio.wait(
-                [pipe_c2w, pipe_w2c],
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-
-            for task in pending:
-                task.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
-
-            # Signal EOF to the other end so it can close gracefully
-            try:
-                if not client_transport.is_closing():
-                    client_transport.write_eof()
-            except Exception:
-                pass
-            try:
-                if not worker_transport.is_closing():
-                    worker_transport.write_eof()
-            except Exception:
-                pass
-
-            log.debug("Relay ended: %s -> port %d", client_addr, worker_port)
+            # === Step 6: Bidirectional relay (cancel-safe) ===
+            await self._relay_standard(client_reader, worker_reader, client_writer, worker_writer, worker_port)
 
         except (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError):
             log.debug("Connection dropped: %s", client_addr)
@@ -226,20 +223,84 @@ class AsyncSOCKS5Balancer:
             if worker_writer and not worker_writer.is_closing():
                 worker_writer.close()
 
+    async def _relay_standard(
+        self,
+        client_reader,
+        worker_reader,
+        client_writer,
+        worker_writer,
+        worker_port,
+    ):
+        """Standard bidirectional relay."""
+        client_transport = client_writer.transport
+        worker_transport = worker_writer.transport
+
+        pipe_c2w = asyncio.create_task(
+            self._relay(client_reader, worker_transport, "c2w")
+        )
+        pipe_w2c = asyncio.create_task(
+            self._relay(worker_reader, client_transport, "w2c")
+        )
+
+        done, pending = await asyncio.wait(
+            [pipe_c2w, pipe_w2c],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+
+        for transport in (client_transport, worker_transport):
+            try:
+                if not transport.is_closing():
+                    transport.write_eof()
+            except Exception:
+                pass
+
+        self.selector.on_success(worker_port, 0.0)
+        self.selector.on_connection_close(worker_port)
+
+    async def _relay_with_peekable(
+        self,
+        peekable: PeekableStreamReader,
+        worker_reader,
+        client_writer,
+        worker_writer,
+    ):
+        """Relay using a PeekableStreamReader for the client side."""
+        client_transport = client_writer.transport
+        worker_transport = worker_writer.transport
+
+        pipe_c2w = asyncio.create_task(
+            self._relay(peekable, worker_transport, "c2w")
+        )
+        pipe_w2c = asyncio.create_task(
+            self._relay(worker_reader, client_transport, "w2c")
+        )
+
+        done, pending = await asyncio.wait(
+            [pipe_c2w, pipe_w2c],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+
+        for transport in (client_transport, worker_transport):
+            try:
+                if not transport.is_closing():
+                    transport.write_eof()
+            except Exception:
+                pass
+
     @staticmethod
-    async def _relay(reader: asyncio.StreamReader, transport: asyncio.Transport, label: str):
-        """
-        High-performance relay: reads from StreamReader and writes directly to Transport.
-        Uses transport.write() instead of StreamWriter.write() to avoid drain() overhead.
-        """
-        loop = asyncio.get_event_loop()
+    async def _relay(reader, transport: asyncio.Transport, label: str):
+        """High-performance relay: reads from reader and writes directly to Transport."""
         try:
             while True:
                 data = await reader.read(PIPE_BUFFER_SIZE)
                 if not data:
                     break
-                # transport.write() is non-blocking — just buffers data internally
-                # The OS TCP stack handles backpressure via window sizing
                 transport.write(data)
         except asyncio.CancelledError:
             raise

@@ -1,16 +1,26 @@
+import argparse
 import asyncio
 import base64
 import logging
 import os
 import sys
+import time
 import urllib.request
 from typing import List
 
 from colorama import Fore
 from colorama import init as colorama_init
+from rich.console import Console, Group as RenderGroup
+from rich.live import Live
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
+from rich.align import Align
 
 from utils.balancer import AsyncSOCKS5Balancer
+from utils.http_proxy import HTTPConnectProxy
 from utils.parser import parse_uri_to_outbound
+from utils.worker_selector import create_selector
 from utils.xray import (
     XrayWorkerManager,
     cleanup_stale_configs,
@@ -20,18 +30,14 @@ from utils.xray import (
 
 BALANCER_HOST = "0.0.0.0"
 BALANCER_PORT = 7070
+HTTP_PROXY_PORT = 7071
 CONFIGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs.txt")
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "xbalance.log")
 
-BANNER = f"""
-{Fore.CYAN}================================ XBalance ================================
-{Fore.CYAN}  Multi-Socket SOCKS5 Load Balancer  |  v0.1.1-alpha{Fore.RESET}
-{Fore.CYAN}========================================================================={Fore.RESET}
-"""
+console = Console()
 
 
 def setup_logging():
-    """Configure logging to both file and console."""
     logger = logging.getLogger("xbalance")
     logger.setLevel(logging.DEBUG)
 
@@ -52,14 +58,11 @@ def setup_logging():
 
 
 def load_raw_configs() -> List[str]:
-    """Reads configs from configs.txt. Fetches subscriptions if URLs are found."""
     log = logging.getLogger("xbalance.main")
 
     if not os.path.exists(CONFIGS_FILE):
         with open(CONFIGS_FILE, "w", encoding="utf-8") as f:
-            f.write(
-                "# Paste your V2Ray configs or Subscription URLs below, one per line.\n"
-            )
+            f.write("# Paste your V2Ray configs or Subscription URLs below, one per line.\n")
         return []
 
     configs: List[str] = []
@@ -89,23 +92,15 @@ def load_raw_configs() -> List[str]:
                             decoded = raw_data.decode("utf-8")
 
                         sub_links = decoded.splitlines()
-                        count = sum(
-                            1
-                            for ln in sub_links
-                            if ln.strip() and not ln.strip().startswith("#")
-                        )
-                        print(
-                            f"{Fore.GREEN}[+] Fetched {count} configs from subscription!{Fore.RESET}"
-                        )
+                        count = sum(1 for ln in sub_links if ln.strip() and not ln.strip().startswith("#"))
+                        print(f"{Fore.GREEN}[+] Fetched {count} configs from subscription!{Fore.RESET}")
                         log.info("Fetched %d configs from subscription", count)
                         for sub_link in sub_links:
                             sub_link = sub_link.strip()
                             if sub_link and not sub_link.startswith("#"):
                                 configs.append(sub_link)
                 except Exception as e:
-                    print(
-                        f"{Fore.RED}[-] Failed to fetch subscription: {e}{Fore.RESET}"
-                    )
+                    print(f"{Fore.RED}[-] Failed to fetch subscription: {e}{Fore.RESET}")
                     log.error("Failed to fetch subscription %s: %s", line, e)
             else:
                 configs.append(line)
@@ -113,97 +108,306 @@ def load_raw_configs() -> List[str]:
     return configs
 
 
-async def stats_printer_loop(balancer: AsyncSOCKS5Balancer):
-    """Prints connection stats to console every 2 seconds."""
-    try:
-        while True:
-            await asyncio.sleep(2)
-            print("\033c", end="")
-            print(BANNER)
-            print(
-                f"  {Fore.CYAN}Proxy Address :{Fore.RESET}  socks://Og@{balancer.host}:{balancer.port}#XBalance"
+def _make_worker_bar(up: int, total: int, width: int = 30) -> Text:
+    """Build a colored progress bar text."""
+    t = Text()
+    ratio = up / total if total > 0 else 0
+    filled = int(ratio * width)
+    color = "green" if ratio > 0.8 else "yellow" if ratio > 0.5 else "red"
+    t.append("[" , style="dim")
+    t.append("#" * filled, style=color)
+    t.append("-" * (width - filled), style="dim")
+    t.append("]", style="dim")
+    return t
+
+
+def _make_mini_bar(conns: int, max_conns: int) -> Text:
+    """Build a small bar for per-worker connection load."""
+    t = Text()
+    width = 10
+    ratio = conns / max_conns if max_conns > 0 else 0
+    filled = int(ratio * width)
+    color = "green" if ratio > 0.6 else "cyan" if ratio > 0.3 else "dim"
+    t.append("=" * filled, style=color)
+    t.append("." * (width - filled), style="dim")
+    return t
+
+
+def _build_dashboard(balancer: AsyncSOCKS5Balancer, http_proxy, start_time: float):
+    """Build the rich renderable for the live display."""
+    selector = balancer.selector
+    ports = balancer.worker_ports
+    total_workers = len(ports)
+    unhealthy = selector.stats.unhealthy
+    up = total_workers - len(unhealthy)
+
+    total_conns = sum(selector.stats.active_conns.values())
+    total_reqs = sum(selector.stats.total_requests.values())
+
+    measured = [selector.stats.avg_response_time(p) for p in ports if selector.stats.avg_response_time(p) > 0]
+    avg_rt = sum(measured) / len(measured) if measured else 0.0
+
+    strategy = type(selector).__name__.replace("Selector", "")
+    uptime = int(time.time() - start_time)
+    uptime_str = f"{uptime // 3600}h {(uptime % 3600) // 60}m {uptime % 60}s"
+
+    # ── Header ──
+    header = Text()
+    header.append("  X B A L A N C E", style="bold white")
+    header.append("  v0.2.0", style="dim")
+    header.append(f"    {uptime_str}", style="dim")
+
+    # ── Stats grid ──
+    stats_table = Table(show_header=False, box=None, padding=(0, 2), expand=True)
+    stats_table.add_column(ratio=1)
+    stats_table.add_column(ratio=1)
+    stats_table.add_column(ratio=1)
+    stats_table.add_column(ratio=1)
+
+    strat_text = Text(strategy, style="bold cyan")
+    worker_text = Text()
+    worker_text.append(str(up), style="bold green" if up == total_workers else "bold yellow")
+    worker_text.append(f"/{total_workers}", style="dim")
+
+    conns_text = Text(str(total_conns), style="bold white")
+    rt_text = Text(f"{avg_rt:.0f}ms" if avg_rt > 0 else "-", style="bold magenta" if avg_rt > 0 else "dim")
+
+    reqs_text = Text(f"{total_reqs:,}", style="bold white")
+
+    stats_table.add_row(
+        Text("strategy", style="dim"), strat_text,
+        Text("workers", style="dim"), worker_text,
+    )
+    stats_table.add_row(
+        Text("active", style="dim"), conns_text,
+        Text("avg rt", style="dim"), rt_text,
+    )
+    stats_table.add_row(
+        Text("total", style="dim"), reqs_text,
+        Text("", style="dim"), Text(""),
+    )
+
+    # ── Worker bar ──
+    bar_text = Text()
+    bar_text.append("  ", style="dim")
+    bar_text.append_text(_make_worker_bar(up, total_workers, 30))
+    bar_text.append(f"  {up}/{total_workers}", style="dim")
+
+    # ── Worker table ──
+    max_conns = max((selector.stats.active_conns[p] for p in ports), default=1) or 1
+
+    worker_table = Table(
+        show_header=True, header_style="bold dim",
+        expand=True, padding=(0, 1),
+        show_edge=False,
+    )
+    worker_table.add_column("status", width=2, justify="center")
+    worker_table.add_column("port", style="bold", justify="right")
+    worker_table.add_column("conns", justify="right")
+    worker_table.add_column("requests", justify="right")
+    worker_table.add_column("latency", justify="right")
+    worker_table.add_column("load", min_width=12)
+
+    show_individual = total_workers <= 16
+
+    if show_individual:
+        for port in ports:
+            is_down = port in unhealthy
+            status = Text("x", style="bold red") if is_down else Text("o", style="bold green")
+            port_text = Text(f"{port}", style="dim" if is_down else "white")
+
+            conns = selector.stats.active_conns[port]
+            total = selector.stats.total_requests[port]
+            rt = selector.stats.avg_response_time(port)
+
+            conns_text = Text(str(conns), style="dim" if conns == 0 else "cyan")
+            total_text = Text(f"{total:,}", style="dim" if total == 0 else "white")
+            rt_text = Text(f"{rt:.0f}ms", style="magenta") if rt > 0 else Text("-", style="dim")
+            bar = _make_mini_bar(conns, max_conns)
+
+            worker_table.add_row(status, port_text, conns_text, total_text, rt_text, bar)
+    else:
+        top = sorted(ports, key=lambda p: selector.stats.active_conns[p], reverse=True)[:8]
+        for port in top:
+            is_down = port in unhealthy
+            status = Text("x", style="bold red") if is_down else Text("o", style="bold green")
+            conns = selector.stats.active_conns[port]
+            total = selector.stats.total_requests[port]
+            rt = selector.stats.avg_response_time(port)
+
+            worker_table.add_row(
+                status,
+                Text(f"{port}", style="white"),
+                Text(str(conns), style="cyan" if conns > 0 else "dim"),
+                Text(f"{total:,}", style="white" if total > 0 else "dim"),
+                Text(f"{rt:.0f}ms", style="magenta") if rt > 0 else Text("-", style="dim"),
+                _make_mini_bar(conns, max_conns),
             )
-            print(
-                f"  {Fore.CYAN}Active        :{Fore.RESET}  {balancer.active_connections} connections"
+        if len(ports) > 8:
+            remaining = len(ports) - 8
+            worker_table.add_row(
+                Text(""),
+                Text(f"+{remaining}", style="dim italic"),
+                Text(""), Text(""), Text(""), Text(""),
             )
-            print(
-                f"  {Fore.CYAN}Total Routed  :{Fore.RESET}  {balancer.rr_index} requests"
-            )
-            print(
-                f"  {Fore.CYAN}Workers       :{Fore.RESET}  {len(balancer.worker_ports)}"
-            )
-            print()
-            print(f"  {Fore.WHITE}Worker Distribution:{Fore.RESET}")
-            for port, count in balancer.connection_stats.items():
-                bar = "█" * min(count, 50)
-                print(
-                    f"    {Fore.GREEN}Port {port}{Fore.RESET} : {count:>5} reqs  {Fore.YELLOW}{bar}{Fore.RESET}"
-                )
-            print()
-            print(f"  {Fore.WHITE}Press Ctrl+C to stop.{Fore.RESET}")
-    except asyncio.CancelledError:
-        pass
+
+    # ── Footer ──
+    footer = Text()
+    footer.append("  ctrl+c to stop", style="dim italic")
+
+    # ── Assemble as group of renderables ──
+    return Panel(
+        RenderGroup(
+            header,
+            Text(""),
+            stats_table,
+            bar_text,
+            Text(""),
+            worker_table,
+            footer,
+        ),
+        border_style="cyan",
+        padding=(1, 2),
+    )
+
+
+async def stats_printer_loop(
+    balancer: AsyncSOCKS5Balancer,
+    http_proxy=None,
+):
+    """Live TUI dashboard using rich."""
+    start_time = time.time()
+
+    with Live(console=console, refresh_per_second=1, screen=True) as live:
+        try:
+            while True:
+                await asyncio.sleep(1)
+                dashboard = _build_dashboard(balancer, http_proxy, start_time)
+                live.update(dashboard)
+        except asyncio.CancelledError:
+            pass
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="XBalance - Multi-Socket Load Balancer for V2Ray/Xray",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--strategy",
+        choices=["round-robin", "least-conn", "response-time", "weighted"],
+        default="round-robin",
+        help="Worker selection strategy (default: round-robin)",
+    )
+    parser.add_argument(
+        "--socks-port",
+        type=int,
+        default=BALANCER_PORT,
+        help=f"SOCKS5 proxy port (default: {BALANCER_PORT})",
+    )
+    parser.add_argument(
+        "--http-port",
+        type=int,
+        default=HTTP_PROXY_PORT,
+        help=f"HTTP CONNECT proxy port (default: {HTTP_PROXY_PORT}, 0 = disabled)",
+    )
+    parser.add_argument(
+        "--parallel-downloads",
+        action="store_true",
+        default=False,
+        help="Enable parallel download feature for large HTTP files",
+    )
+    parser.add_argument(
+        "--parallel-threshold",
+        type=int,
+        default=10 * 1024 * 1024,
+        help="Minimum file size in bytes for parallel download (default: 10MB)",
+    )
+    parser.add_argument(
+        "--peek-http",
+        action="store_true",
+        default=False,
+        help="Peek at SOCKS5 tunnel to detect HTTP traffic",
+    )
+    return parser.parse_args()
 
 
 async def main():
-    """Main entrypoint: parse configs, start xray workers, run balancer."""
+    args = parse_args()
     log = setup_logging()
     colorama_init()
-    print(BANNER)
-    log.info("XBalance starting up")
+    console.print(
+        Panel(
+            Align.center(
+                Text.from_markup("[bold white]X B A L A N C E[/] [dim]v0.2.0[/]\n[dim]Multi-Socket Load Balancer for V2Ray/Xray[/]")
+            ),
+            border_style="cyan",
+            padding=(1, 4),
+        )
+    )
+    log.info("XBalance starting up (strategy=%s)", args.strategy)
 
-    # 0. Kill any orphan xray processes from previous runs
     kill_stale_xray()
 
-    # 1. Ensure xray binary
     xray_bin = ensure_xray_binary()
 
-    # 2. Load raw config URIs
     raw_uris = load_raw_configs()
     if not raw_uris:
-        print(f"{Fore.RED}[-] No configs found in configs.txt{Fore.RESET}")
-        print(
-            f"{Fore.RED}[-] Add your vmess://, vless://, trojan://, ss:// links or subscription URLs and try again.{Fore.RESET}"
-        )
+        console.print("[bold red]No configs found in configs.txt[/]")
+        console.print("[red]Add your vmess://, vless://, trojan://, ss:// links or subscription URLs and try again.[/]")
         return
 
-    # 3. Parse into Xray outbound structures
-    outbounds: List[dict] = []
+    outbounds = []
     for uri in raw_uris:
         outbound = parse_uri_to_outbound(uri)
         if outbound:
             outbounds.append(outbound)
 
     if not outbounds:
-        print(
-            f"{Fore.RED}[-] None of the configs could be parsed. Check your config format.{Fore.RESET}"
-        )
+        console.print("[bold red]None of the configs could be parsed. Check your config format.[/]")
         return
 
-    print(f"{Fore.GREEN}[+] Parsed {len(outbounds)} configs successfully.{Fore.RESET}")
+    console.print(f"[green]Parsed {len(outbounds)} configs successfully.[/]")
     log.info("Parsed %d outbound configs", len(outbounds))
 
-    # 4. Start Xray workers
     manager = XrayWorkerManager(xray_bin)
-    print(f"{Fore.YELLOW}[*] Starting {len(outbounds)} local workers...{Fore.RESET}")
+    console.print(f"[yellow]Starting {len(outbounds)} local workers...[/]")
     worker_ports = await manager.start_workers(outbounds)
 
     if not worker_ports:
-        print(
-            f"{Fore.RED}[-] No workers started. Check your configs and try again.{Fore.RESET}"
-        )
+        console.print("[bold red]No workers started. Check your configs and try again.[/]")
         return
 
-    print(f"{Fore.GREEN}[+] {len(worker_ports)} workers running!{Fore.RESET}")
+    console.print(f"[green]{len(worker_ports)} workers running![/]")
     log.info("%d workers running on ports %s", len(worker_ports), worker_ports)
 
-    # 5. Start the SOCKS5 balancer
-    balancer = AsyncSOCKS5Balancer(BALANCER_HOST, BALANCER_PORT, worker_ports)
+    selector = create_selector(args.strategy, worker_ports)
 
-    stats_task = asyncio.create_task(stats_printer_loop(balancer))
+    balancer = AsyncSOCKS5Balancer(
+        BALANCER_HOST,
+        args.socks_port,
+        selector,
+        peek_http=args.peek_http,
+    )
+
+    http_proxy = None
+    if args.http_port > 0:
+        http_proxy = HTTPConnectProxy(
+            BALANCER_HOST,
+            args.http_port,
+            selector,
+            parallel_downloads=args.parallel_downloads,
+            parallel_threshold=args.parallel_threshold,
+        )
+
+    stats_task = asyncio.create_task(stats_printer_loop(balancer, http_proxy))
+
+    tasks = [asyncio.create_task(balancer.start())]
+    if http_proxy:
+        tasks.append(asyncio.create_task(http_proxy.start()))
 
     try:
-        await balancer.start()
+        await asyncio.gather(*tasks)
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass
     finally:
@@ -213,7 +417,6 @@ async def main():
 
 
 def main_cli():
-    """CLI entrypoint."""
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
