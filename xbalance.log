@@ -1,0 +1,4 @@
+2026-06-03 18:43:40 [INFO] xbalance.main: XBalance starting up
+2026-06-03 18:43:40 [WARNING] xbalance.xray: taskkill output: ERROR: The process "xray.exe" with PID 10700 could not be terminated.
+Reason: Access is denied.
+2026-06-03 18:43:40 [INFO] xbalance.xray: Downloading xray binary from https://github.com/XTLS/Xray-core/releases/latest/download/Xray-windows-64.zip

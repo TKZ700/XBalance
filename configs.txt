@@ -1,3 +1,0 @@
-# Paste your V2Ray config links or subscription URLs below, one per line.
-# Lines starting with '#' or empty lines will be ignored.
-# Supports: vmess://, vless://, trojan://, ss://, http://, and https:// (for subscriptions)
